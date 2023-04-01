@@ -1,0 +1,546 @@
+#! /usr/bin/env python3
+import sys, math, os, argparse, csv, re
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+from Bio import SeqIO
+csv.field_size_limit(sys.maxsize)
+
+# Thanks to Alan C. Christensen, University of Nebraska
+# No guarantees, warranties, support, or anything else is implicit or explicit.
+# Output is a list of unique, ungapped repeated sequences, fasta formatted.
+# The names are in the format '>Repeat/ROUS_name_start_end_length'.
+# A table of repeats with the coordinates of each one is generated.
+# A list of repeat name, length and copy number is generated.
+# A binned table of the total number of repeats in size ranges is generated.
+
+def argParser():
+	parser = argparse.ArgumentParser(prog=sys.argv[0], add_help=True, formatter_class=argparse.RawDescriptionHelpFormatter, description="""
+
+Find dispersed repeats in a fasta sequence file,
+Designed for plant mitochondrial genomes of up to a few Mbp.
+May be very slow with larger genomes.
+
+- Blast sometimes give odd results with large or highly repetetive genomes.
+- Gaps, or runs of 'N's in the sequence will definitely give weird results. 
+- The program assumes there aren't any, and that the longest repeat will 
+     be the full sequence to itself.
+- If there are long repeats in the output that are listed as being only at 
+     one location, this is probably what happened.
+- If there are a lot of repeats within repeats the results can also be odd.
+
+""", epilog="""
+
+################# AUTHORS #########################
+#  Fu-Hao Lu
+#  FRSB, Dr.
+#  State Key Lorboratory of Crop Stress Adaptation and Improvement
+#  Jinming Campus, Henan University
+#  Kaifeng 475004, Henan Province, China
+#  E-mail: lufuhao@henu.edu.cn
+""")
+	parser.add_argument('infile', action='store', help='Input .fasta file, could be multifasta')
+	parser.add_argument('--out', '-o', action='store', dest='out', type=str, metavar="<PREFIX>", help='Output file name prefix, default: %(default)s', default='MyOut')
+	parser.add_argument('--minlen', '-m', action='store', dest='minlen', type=int, metavar="<INT>", help='Minimum length of matches to keep, default: %(default)s', default=50)
+	parser.add_argument('--wordsize', '-w', action='store', dest='wordsize', type=int, metavar="<INT>", help='word_size for blast, should <= -m, default: %(default)s', default=28)
+	parser.add_argument('--dbfasta', '-f', action='store', dest='dbfasta', type=str, metavar="<FILE>", help='Repeat datase in fasta format, default: %(default)s', default='')
+	parser.add_argument('--identity', action='store', dest='identity', type=float, metavar="0-100", help='Percentage identity, default: %(default)s', default=90)
+	parser.add_argument('--reward', action='store', dest='reward', type=int, metavar="<INT>", help='Reward for match, default: %(default)s', default=1)
+	parser.add_argument('--penalty', action='store', dest='penalty', type=int, metavar="<INT>", help='Penalty for mismatch, default: %(default)s', default=-20)
+	parser.add_argument('--digit', action='store', dest='digit', type=int, metavar="<INT>", help='Number of digits for decimal, default: %(default)s', default=2)
+	parser.add_argument('--keep', '-k', action='store_true', dest='keep', help='True to keep temp files', default=False)
+	parser.add_argument('--gbff', action='store_true', dest='gbff', help='True to write GenBank GBFF format file', default=False)
+	parser.add_argument('--embl', action='store_true', dest='embl', help='True to write EMBL format file', default=False)
+	parser.add_argument('--gff3', action='store_true', dest='gff3', help='True to write GFF3 format file', default=False)
+	parser.add_argument('--version', action='version', dest='version', version='v3.0b2', help='Display version')
+	params = parser.parse_args()
+	return params
+
+
+
+
+# open tempblast.txt, convert to list of lists, and sort by length and position descending
+# This is necessary because blastn does not output every possible pair of hits when there are more than 2 copies of a repeat
+def blast1list(BLfile):
+	BLobj = open(BLfile, 'r')
+	BLreader = csv.reader(BLobj)
+	BLalign = list(BLreader)    ### For test ###
+	BLobj.close()
+#	print (BLalign)
+	BLalign = sorted(BLalign, key=lambda x: (-1*int(x[3]), -1*int(x[1])))
+	BLalign.append(['S', '1','1','1','1','1','0','A','X'])
+#	print (BLalign)    ### For test ###
+	return BLalign
+
+
+
+# run blastn with query file plus strand (removing first line which is full length sequence), minus strand, and concatenate
+def blast1run(BRfile, BRtempblast):
+	os.system('blastn -query '+BRfile+' -strand plus -subject '+BRfile+' -word_size '+str(args.wordsize)+ ' -perc_identity '+ str(args.identity) + ' -reward '+str(args.reward)+' -penalty '+str(args.penalty)+' -ungapped -dust no -soft_masking false -evalue 10  -outfmt "10 qseqid qstart qend length sstart send mismatch sstrand qseq" | tail -n+2 > tempblast1.txt')
+	os.system('blastn -query '+BRfile+' -strand minus -subject '+BRfile+' -word_size '+str(args.wordsize)+' -perc_identity '+ str(args.identity) + ' -reward '+str(args.reward)+' -penalty '+str(args.penalty)+' -ungapped -dust no -soft_masking false -evalue 10 -outfmt "10 qseqid qstart qend length sstart send mismatch sstrand qseq" > tempblast2.txt')
+	os.system('cat tempblast1.txt tempblast2.txt > '+BRtempblast)
+	fileDelete(['tempblast1.txt', 'tempblast2.txt'])
+
+
+
+# Now find each copy of each repeat. Again, this is because the blastn output file does not have every possible alignment.
+# It is also because the information on locations and strand is not organized well in the blastn output.
+# In addition, this subroutine eliminates duplicates of nested repeats.
+def blast2run(BRquery, BRsubject, BRout):
+	os.system('blastn -query '+BRquery+' -strand both -subject '+BRsubject+' -word_size '+str(args.wordsize)+' -perc_identity '+ str(args.identity) +' -reward ' + str(args.reward) + ' -penalty ' + str(args.penalty)+' -ungapped -dust no -soft_masking false -evalue 1000 -outfmt "10 qseqid length sseqid sstart send sstrand qcovhsp" > '+BRout)
+
+
+
+def fileDelete(FDlist):
+	for FDindf in FDlist:
+		try:
+			os.remove(FDindf)
+		except OSError as e:
+			sys.stderr.write("Error: %s : %s" % (FDindf, e.strerror))
+
+
+
+def fileMerger(FMout, FMinlist):
+	FMdict={}
+	for FMindf in FMinlist:
+		for FMfaobj in SeqIO.parse(FMindf, "fasta"):
+#			print(str(FMfaobj.seq))   ### For test ###
+#			print(str(Seq.reverse_complement(FMfaobj.seq)))   ### For test ###
+			if str(FMfaobj.seq) in FMdict:
+				continue
+			elif str(Seq.reverse_complement(FMfaobj.seq)) in FMdict:
+				continue
+			else:
+				FMdict[str(FMfaobj.seq)]={}
+				FMdict[str(FMfaobj.seq)]['id']=str(FMfaobj.id)
+				FMdict[str(FMfaobj.seq)]['desc']=str(FMfaobj.description)
+	FMrepobj=open(FMout, "w")
+	FMfa_io=SeqIO.FastaIO.FastaWriter(FMrepobj, wrap=70)
+	FMnum=0
+	for FMindk in FMdict.keys():
+		FMnum+=1
+		FMrecord=SeqRecord(Seq(FMindk),id=FMdict[FMindk]['id'],
+		        name=FMdict[FMindk]['id'], description=FMdict[FMindk]['desc'])
+		FMfa_io.write_record(FMrecord)
+	FMrepobj.close()
+
+
+
+def repCopy(RCdb):
+	RCcopy = []
+	RCobj=open(RCdb, 'r')
+	for RCline in RCobj:
+		if RCline.startswith('>'):
+			RCline=RCline.rstrip()
+#			print(RCline)        ### For test ###
+			RCline2=re.sub(r'^>', '', RCline)
+#			print(RCline2)        ### For test ###
+			RClist=[]
+			RClist=list(RCline2.split(' '))
+#			print (RClist)        ### For test ###
+			RCcopy.append([RClist[0], RClist[1]])
+#	print (RCcopy)        ### For test ###
+	return RCcopy
+
+
+
+# New list of uniques
+# Start at row 0. Compare to subsequent rows. 
+# If repeat length is different from the next row, it has passed all the tests, write it to the file.
+# If query or subject coordinates are the same as the query or subject or reversed coordinates
+# of a subsequent row, it is not unique, so go to the next row and do the comparisons again.
+# qseqid qstart qend length sstart send mismatch sstrand qseq
+def uniqRep (URout, URaln):
+	URuniq = []
+	URobj = open(URout, 'w')
+	for URrow in range(len(URaln)):
+		if int(URaln[URrow][3]) < args.minlen:
+			# This won't happen unless the word_size is defined as something other than minlen.
+			# That could be useful under some circumstances.
+			URobj.write('row '+str(URrow)+' is less than '+str(args.minlen))
+			break   ### length sorted. the following alignment are all < minlen
+		URobj.write('row '+str(URrow)+'\n')
+		UR1qsrt=URaln[URrow][1]
+		UR1qend=URaln[URrow][2]
+		UR1ssrt=URaln[URrow][4]
+		UR1send=URaln[URrow][5]
+### To be improved
+		for URnext in range(URrow+1,len(URaln)):
+			if URaln[URrow][3] != URaln[URnext][3]: 
+				URuniq.append(URaln[URrow])
+				URobj.write('\tadding row '+str(URrow)+' to unique list\n')
+				break
+			UR2qsrt=URaln[URnext][1]
+			UR2qend=URaln[URnext][2]
+			UR2ssrt=URaln[URnext][4]
+			UR2send=URaln[URnext][5]
+			URobj.write('\tcomparing to '+str(URnext)+'\n')
+			if UR1qsrt == UR2qsrt and UR1qend == UR2qend:
+				URobj.write('\tqstart and qend of row '+str(URrow)+' and '+str(URnext)+' are the same\n')
+				break
+			elif UR1qsrt == UR2qend and UR1qend == UR2qsrt:
+				URobj.write('\tqstart and qend of row '+str(URrow)+' is the same as qend and qstart of '+str(URnext)+'\n')
+				break
+			elif UR1qsrt == UR2ssrt and UR1qend == UR1send:
+				URobj.write('\tqstart and qend of row '+str(URrow)+' is the same as sstart and send of '+str(URnext)+'\n')
+				break
+			elif UR1qsrt == UR1send and UR1qend == UR2ssrt:
+				URobj.write('\tqstart and qend of row '+str(URrow)+' is the same as send and sstart of '+str(URnext)+'\n')
+				break
+			elif UR2ssrt == UR2qsrt and UR1send== UR2qend:
+				URobj.write('\tsstart and send of row '+str(URrow)+' is the same as qstart and qend of '+str(URnext)+'\n')
+				break
+			elif UR2ssrt == UR2qend and UR1send == UR2qsrt:
+				URobj.write('\tsstart and send of row '+str(URrow)+' is the same as qend and qstart of '+str(URnext)+'\n')
+				break
+			elif UR2ssrt == UR2ssrt and UR1send == UR1send:
+				URobj.write('\tsstart and send of row '+str(URrow)+' is the same as sstart and send of '+str(URnext)+'\n')
+				break
+			elif UR2ssrt == UR1send and UR1send == UR2ssrt:
+				URobj.write('\tsstart and send of row '+str(URrow)+' is the same as send and sstart of '+str(URnext)+'\n')
+				break
+			else:
+				URobj.write('\t'+str(URrow)+' is different\n')
+	URobj.close()
+	return URuniq
+
+
+
+def writeFasta(WFout, WRseqobj):
+	WFfaobj=open(WFout, 'w')
+	WFfa_io=SeqIO.FastaIO.FastaWriter(WFfaobj, wrap=70)
+	WFfa_io.write_record(WRseqobj)
+	WFfaobj.close()
+
+
+
+def writeRep(WRout, WRidx, WRuniq):
+	# Write uniques into output file
+	# Start list for copy number table
+	WRcount = 0
+	WRfaobj = open(WRout, 'w')
+	WRfa_io=SeqIO.FastaIO.FastaWriter(WRfaobj, wrap=70)
+	
+	for WRi in range(len(WRuniq)):
+		WRseqid=WRuniq[WRi][0]
+		WRqstart = WRuniq[WRi][1]
+		WRqend = WRuniq[WRi][2]
+		WRlen = WRuniq[WRi][3]
+		WRseq = WRuniq[WRi][8]
+		WRcount+=1
+		WRfa_io.write_record(SeqRecord(Seq(WRseq),id="Repeat_"+str(WRidx),
+		        name="Repeat_"+str(WRidx), description=str(WRlen) + ' ' + 
+		        WRseqid + ':' + str(WRqstart) + '-' + str(WRqend)))
+		WRidx += 1
+	
+	WRfaobj.close()
+	if WRcount == 0:
+		sys.stderr.write("Warnings: Repeats of unusual size? I don't think they exist")
+
+
+
+def writeTable(WTout, WTdict):
+	WTobj=open(WTout,'w')
+	if 'name' in WTdict:
+		WTobj.write("seqID\t")
+		WTobj.write("\t".join(WTdict['name']))
+		WTobj.write("\n")
+		del WTdict['name']
+	if 'leng' in WTdict:
+		WTobj.write("Length\t")
+		WTobj.write("\t".join(str(WTi) for WTi in WTdict['leng']))
+		WTobj.write("\n")
+		del WTdict['leng']
+	if 'tonu' in WTdict:
+		WTobj.write("RepNum\t")
+		WTobj.write("\t".join(str(WTi) for WTi in WTdict['tonu']))
+		WTobj.write("\n")
+		del WTdict['tonu']
+	if 'avsz' in WTdict:
+		WTobj.write("RepAvgSize\t")
+		WTobj.write("\t".join(str(WTi) for WTi in WTdict['avsz']))
+		WTobj.write("\n")
+		del WTdict['avsz']
+	if 'avcp' in WTdict:
+		WTobj.write("RepAvgCopy\t")
+		WTobj.write("\t".join(str(WTi) for WTi in WTdict['avcp']))
+		WTobj.write("\n")
+		del WTdict['avcp']
+	for WTrep in WTdict:
+		WTobj.write(WTrep+"\t")
+		WTobj.write("\t".join(str(WTi) for WTi in WTdict[WTrep]))
+		WTobj.write("\n")
+	WTobj.close()
+
+
+
+if __name__ == '__main__':
+	args=argParser()
+#	print (args)   ### For test ###
+	
+	###defaults
+	seqnum=0
+	step=0
+	seqdict={}
+	repflist=list()
+	repdlist=list()
+	seqlist=list()
+	existing_db=False
+	seqid2len={}
+	merge_rep_fa=args.out+'.1.repeats.fa'
+	outtab = args.out+'.2.rep.table'
+	outcount = args.out+'.3.rep.counts'
+	outbin = args.out+'.4.binned'
+	faidx=1
+	tmpfiles=[]    ### file list to be deleted
+	numdigit=args.digit
+	### defining the bins
+	bin_dict = {}
+	binned={}
+	i = 0
+	j = 50
+	while j < 1000:
+		bin_dict[i] = j
+		i += 1
+		j += 50
+	while j <= 10000:
+		bin_dict[i] = j
+		i +=1
+		j += 250
+	
+	if args.dbfasta != '':
+		if os.path.exists(str(args.dbfasta)):
+			existing_db=True
+		else:
+			sys.stderr.write("Error: --dbfasta file not existing\n" + str(args.dbfasta))
+			sys.exit(100)
+	for seqobj in SeqIO.parse(args.infile, "fasta") :
+		seqnum+=1
+		tmpout="tmp.seq"+str(seqnum)
+		tempfasta = tmpout+'.0.fa'
+		
+		seqname=seqobj.id
+		seqdict[seqnum]=seqname
+		seqlist.append(seqname)
+		seqlen=len(seqobj.seq)
+		if seqname in seqid2len:
+			sys.stderr.write("Error: duplicated seqID: "+seqname+"\n")
+			sys.exit(100)
+		else:
+			seqid2len[seqname]=seqlen
+		print ("seqID: "+seqname+ "    Length: "+ str(seqlen))
+		binned[seqname] = []
+		binned[seqname] = [seqname,seqlen,0]
+		j = 50
+		while j < 1000:
+			binned[seqname].append(0)
+			j += 50
+		while j <= 10000:
+			binned[seqname].append(0)
+			j += 250
+		writeFasta(tempfasta, seqobj)
+		repflist.append(tempfasta)
+		
+		###test if using existing repeats DB
+		###Do not construct repeat DB based on infile
+		if existing_db:
+			continue
+		
+		tempblast = tmpout+'.1.blastout'
+		tempparse = tmpout+'.2.sequence_parsing'
+		outfa = tmpout+'.3.rep.fa'
+		#1st blast to get all repeat cordinates
+		step+=1
+		print ("    Step" + str(step)+": 1st run of BLAST to find repeats")
+		blast1run(tempfasta, tempblast)
+	
+		###Sort alignments
+		step+=1
+		print ("    Step" + str(step)+": sorting alignements")
+		alignments=blast1list(tempblast)
+		
+		###make alignment unique and 
+		step+=1
+		print ("    Step" + str(step)+": Finding  unique repeats")
+		uniques=uniqRep(tempparse, alignments)
+		
+		writeRep(outfa, faidx, uniques)
+		faidx+=len(uniques)
+		repdlist.append(outfa)
+		
+		if args.keep == False:
+			tmpfiles.append(tempfasta)
+			tmpfiles.append(tempblast)
+			tmpfiles.append(tempparse)
+			tmpfiles.append(outfa)
+	
+	###Merge all repeat into one, and deduplicate
+	if existing_db:
+		merge_rep_fa=args.dbfasta
+	else: 
+		step+=1
+		print ("Step" + str(step)+": merge repeats")
+		fileMerger(merge_rep_fa,repdlist)
+	
+	### prepare 2nd BLAST
+	repcopies=repCopy(merge_rep_fa)
+	rtobj = open(outtab, 'w')
+	rtobj.write('#seqID\tseqLen\trepID\trepLen\tseqID\tsstart\tsend\tstrand\n')
+	repcount={}
+	repcount['name']=[]
+	repcount['leng']=[]
+	repcount['tonu']=[]
+	repcount['avsz']=[]
+	repcount['avcp']=[]
+	
+	
+	for ix in range(len(repflist)):
+		seqnum=ix+1
+		indf=repflist[ix]
+		seqname=seqlist[ix]
+		seqlen=seqid2len[seqname]
+		temprepeats = "tmp.seq"+str(seqnum)+'.4.blast2out'
+		if args.gbff == True: ### write genbank
+			outgbff = args.out+".seq"+str(seqnum)+'.repeats.gb'
+			genbank_obj = open(outgbff, 'w')
+		if args.embl==True: ### write EMBL
+			outembl = args.out+".seq"+str(seqnum)+'.repeats.embl'
+			embl_obj=open(outembl, 'w')
+		if args.gff3==True: ### write GFF3
+			outgff3=args.out+".seq"+str(seqnum)+'.repeats.gff3'
+			gff3_obj=open(outgff3, 'w')
+		print ("seqID: "+seqname+ "    Length: "+ str(seqlen))
+		
+		step+=1
+		print ("    Step" + str(step)+": 2nd run of BLAST to find all copies of repeats...")
+		blast2run(merge_rep_fa, indf, temprepeats)
+		tempr = open(temprepeats, 'r')
+		reader = csv.reader(tempr)
+		replist = list(reader)
+		tempr.close()
+		
+		step+=1
+		print ("    Step" + str(step)+": Making a table of the repeats...")
+		### make list for entire sequence, set each position as 0
+		posit = []
+		for n in range(seqlen):
+			posit.append(0)
+		
+		### Keep stats on lengths
+		templist = []
+		
+		### look at each repeat in turn
+		### qseqid length qseqid sstart send sstrand qcovhsp
+		for i in range(len(replist)):
+		### if qcovhsp is >98%, write to the file
+		### if repeat is good (>98% identical to another one), write it to the file, and put the name in a list
+			gff3list =[]
+#			print (replist[i])    ### For test ###
+			if int(replist[i][6])<=98:
+				continue
+			# write tab separated values of seqname, seqlength, repeat name, length, seqname, start, end, strand to outtab
+			rtobj.write(seqname+'\t'+str(seqlen)+'\t' + str(replist[i][0])+'\t'
+			            +str(replist[i][1])+'\t'+str(replist[i][2])+'\t'
+			            +str(replist[i][3])+'\t'+str(replist[i][4])+'\t'
+			            +str(replist[i][5])+'\n')
+			if args.gff3==True:
+				gff3list.insert(0,seqname)
+				gff3list.insert(1,'HENU')
+				gff3list.insert(2,'repeat_region')
+				gff3list.insert(5,'.')
+				gff3list.insert(7,'.')
+				gff3list.insert(8,'ID='+str(replist[i][0])+';Name='+str(replist[i][0]))
+			if replist[i][5] == 'minus':
+				location = 'complement('+replist[i][4]+'..'+replist[i][3]+')'
+				gff3list.insert(3,replist[i][4])
+				gff3list.insert(4,replist[i][3])
+				gff3list.insert(6,'-')
+			else:
+				location = replist[i][3]+'..'+replist[i][4]
+				gff3list.insert(3,replist[i][3])
+				gff3list.insert(4,replist[i][4])
+				gff3list.insert(6,'+')
+			if args.gbff == True:
+				genbank_obj.write('     repeat_region   '+location+'\n'+
+			                      '                     /rpt_type=dispersed\n'+
+			                      '                     /note="'+replist[i][0]+'"\n'
+			                      '                     /standard_name="'+replist[i][0]+'"\n')
+			if args.embl==True:
+				embl_obj.write('FT   repeat_region   '+location+'\n'+
+			                   'FT                   /rpt_type=dispersed\n'+
+			                   'FT                   /note="'+replist[i][0]+'"\n'
+			                   'FT                   /standard_name="'+replist[i][0]+'"\n')
+			if args.gff3==True:
+				outline="\t".join(str(x) for x in gff3list)
+				gff3_obj.write(outline+"\n")
+			templist.append(replist[i][0])
+			# then write 1's at every position in the sequence covered by that repeat
+			# these can then be summed to get total bases of repeats
+			# bases in overlapping repeats are only counted once
+			#qseqid length qseqid sstart send sstrand qcovhsp
+			for n in range(min(int(replist[i][3]), int(replist[i][4]))-1, max(int(replist[i][3]), int(replist[i][4]))):
+				posit[n] = 1
+			# then scan through bin sizes and if a repeat is greater than the
+			# bin_dict size cutoff, add one to the bin
+			for j in range(len(binned[seqname])-4, -1, -1):
+				if bin_dict[j]<=int(replist[i][1]):
+					binned[seqname][j+3] +=1
+					break
+		binned[seqname][2] = posit.count(1)
+		
+		### make list for GBFF file
+		if args.gbff == True:
+			genbank_obj.close()
+		if args.embl==True:
+			embl_obj.close()
+		if args.gff3==True:
+			gff3_obj.close()
+		# write tab separated values of repeat name, length, copy number to outcount
+		# first two lines are also a table of stats on repeats
+		rep_total_num = 0
+		rep_total_size = 0
+		rep_copy_num = 0
+		for i in range(len(repcopies)):
+			repname = repcopies[i][0]
+			replen = float(repcopies[i][1])
+			repcop = float(templist.count(repname))
+			
+			if repcop>0:
+				rep_total_num += 1
+				rep_total_size += replen
+				rep_copy_num += repcop
+			if repname not in repcount:
+				repcount[repname]=[]
+			repcount[repname].append(repcop)
+
+		if rep_total_num == 0:
+			rep_avg_size = 'NA'
+			rep_avg_copynum = 'NA'
+		else:
+			rep_avg_size = format(rep_total_size/rep_total_num,numdigit, '.'+str(digit)+'f')
+			rep_avg_copynum = format(rep_copy_num/rep_total_num,numdigit, '.'+str(digit)+'f')
+		repcount['name'].append(seqname)
+		repcount['leng'].append(seqlen)
+		repcount['tonu'].append(rep_total_num)
+		repcount['avsz'].append(rep_avg_size)
+		repcount['avcp'].append(rep_avg_copynum)
+		# Removing temp files if necessary
+		if args.keep == False:
+			tmpfiles.append(temprepeats)
+	
+	rtobj.close()
+	
+	# Write binned table headers, then stats for this sequence.
+	binfile = open(outbin, 'w')
+	binfile.write('Sequence\tSeq_len\tRep_len\t')
+	binfile.write("\t".join(str(bin_dict[y]) for y in range(len(bin_dict))))
+	binfile.write('\n')
+	for indseq in binned:
+		binfile.write("\t".join(str(int(elem)) for elem in binned[indseq]))
+		binfile.write('\n')
+	binfile.close()
+	
+	writeTable(outcount, repcount)
+	
+	if args.keep == False:
+		fileDelete(tmpfiles)
+	print ("Finished...")
