@@ -1,4 +1,4 @@
-# RepFinder
+# RepFinder (RRID: SCR_023429)
 
 > blastn to find repeats in a single or multiple sequences
 
